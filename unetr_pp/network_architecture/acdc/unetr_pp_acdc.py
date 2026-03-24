@@ -5,34 +5,40 @@ from typing import Tuple, Union
 from unetr_pp.network_architecture.neural_network import SegmentationNetwork
 from unetr_pp.network_architecture.dynunet_block import UnetOutBlock, UnetResBlock
 #加入BrightnessEnhancement模块
-from unetr_pp.network_architecture.acdc.model_components import UnetrPPEncoder, UnetrUpBlock,BrightnessEnhancement
+from unetr_pp.network_architecture.acdc.model_components import UnetrPPEncoder, UnetrUpBlock,BoundaryAttentionBlock
 
-# 321
-def make_union_ring_from_logits_3d_hw(logits, ring_k: int = 5, thr: float = 0.5):
+
+def extract_mask_edge_from_logits(logits, thr: float = 0.5):
     """
-    logits: [B, C, D, H, W]
-    该项目 ACDC 通常 C=4 (bg + 3 foreground)，因此 union 使用 channels[1:]
-    仅在 H/W 上做形态学（kernel=(1,k,k)），避免 D 维太小导致奇怪的 ring。
-    return ring: [B,1,D,H,W] in [0,1]
+    基于 AS-UNet 论文提出的“掩膜边缘提取算法”。
+    论文逻辑："遍历像素点值为0，且九宫格内其余像素不都为0时，标记为边缘"
+    数学等价操作：边界 = MaxPool(Mask) - Mask
     """
+    # 1. 先得到二值化的掩膜 (Mask)
     prob = F.softmax(logits, dim=1)
-
-    # 排除背景通道 0
     if prob.shape[1] > 1:
+        # 排除背景通道(0)，其余视为前景
         union_prob = prob[:, 1:, ...].sum(dim=1, keepdim=True)
     else:
-        union_prob = prob  # 极端情况兜底
+        union_prob = prob
 
-    union_mask = (union_prob > thr).float()
+    mask = (union_prob > thr).float()  # [B, 1, D, H, W]
 
-    pad = ring_k // 2
-    k = (1, ring_k, ring_k)
+    # 2. 执行论文中的“九宫格”判定逻辑
+    # 论文提到的“九宫格”对应 3x3 范围。为了适应 ACDC 的 3D 数据，
+    # 我们采用 kernel=(1, 3, 3)，即只在 H 和 W 切片平面上寻找九宫格边缘，避免 D 维度伪影。
+    kernel_size = (1, 3, 3)
+    padding = (0, 1, 1)
 
-    dil = F.max_pool3d(union_mask, kernel_size=k, stride=1, padding=(0, pad, pad))
-    ero = -F.max_pool3d(-union_mask, kernel_size=k, stride=1, padding=(0, pad, pad))
+    # max_pool3d 模拟膨胀：如果九宫格内存在前景(1)，则中心点变为 1
+    dilated = F.max_pool3d(mask, kernel_size=kernel_size, stride=1, padding=padding)
 
-    ring = (dil - ero).clamp(0.0, 1.0)
-    return ring
+    # 3. 提取精确边缘
+    # 当原 mask 为 0 (背景)，且 dilated 为 1 (九宫格内有前景) 时，相减结果为 1
+    # 这精确复现了论文中的掩膜边缘提取算法
+    mask_boundary = (dilated - mask).clamp(min=0.0)
+
+    return mask_boundary
 
 class UNETR_PP(SegmentationNetwork):
     """
@@ -136,9 +142,7 @@ class UNETR_PP(SegmentationNetwork):
         )
         self.out1 = UnetOutBlock(spatial_dims=3, in_channels=feature_size, out_channels=out_channels)
         # 1-在这里加入亮度增强模块
-        self.brightness_enhancement = BrightnessEnhancement(channels=feature_size*2)
-        # 2.0-1
-        # self.brightness_enhancement = BrightnessEnhancement(channels=feature_size)
+        self.boundary_attention = BoundaryAttentionBlock(in_channels=feature_size * 2)
 
         if self.do_ds:
             self.out2 = UnetOutBlock(spatial_dims=3, in_channels=feature_size * 2, out_channels=out_channels)
@@ -150,8 +154,7 @@ class UNETR_PP(SegmentationNetwork):
         return x
 
     def forward(self, x_in):
-        #2-计算输入图像的亮度参考图
-        ref_brightness = x_in[:, 0:1, :, :, :]
+
 
         x_output, hidden_states = self.unetr_pp_encoder(x_in)
 
@@ -167,32 +170,47 @@ class UNETR_PP(SegmentationNetwork):
         dec4 = self.proj_feat(enc4, self.hidden_size, self.feat_size)
         dec3 = self.decoder5(dec4, enc3)
         dec2 = self.decoder4(dec3, enc2)
-        # 321- ring生成
-        ring = None
-        if self.do_ds:
-            logits3_coarse = self.out3(dec2)  # [B,4,D,H,W] (通常)
-            ring = make_union_ring_from_logits_3d_hw(logits3_coarse.detach(), ring_k=5, thr=0.5)
-
         dec1 = self.decoder3(dec2, enc1)
 
-        # 3-
-        target_size = dec1.shape[2:]  # 获取 (D, H, W)
-        ref_resized = F.interpolate(
-            ref_brightness,
-            size=target_size,
-            mode='trilinear',
-            align_corners=False
-        )
-        #321
-        ring_resized = None
-        if ring is not None:
-            ring_resized = F.interpolate(ring, size=target_size, mode='nearest')
-        dec1_enhanced = self.brightness_enhancement(dec1, ref_resized, ring_resized)        # 4-
-        out = self.decoder2(dec1_enhanced, convBlock)
-        # 5-
+        # ===================================================================
+        # 1. 基础网络直接输出 (对应论文的"输出1")
+        # 主干网络正常前向传播，完全不依赖 BAB
+        # ===================================================================
+        out = self.decoder2(dec1, convBlock)
+        logits_main = self.out1(out)  # 这就是测试时最终使用的输出1
+
+        # ===================================================================
+        # 2. 边缘注意辅助分支 (对应论文的 Add: 训练时增加 BAB 得到"输出2")
+        # nnUNet 框架下，do_ds=True 代表处于训练或验证阶段 (需要多尺度深度监督)
+        # ===================================================================
         if self.do_ds:
-            logits = [self.out1(out), self.out2(dec1_enhanced), self.out3(dec2)]
+            # 提取粗预测并计算掩膜边缘图
+            logits3_coarse = self.out3(dec2)
+            mask_boundary = extract_mask_edge_from_logits(logits3_coarse.detach(), thr=0.5)
+
+            # 调整边缘图大小以匹配 dec1
+            target_size = dec1.shape[2:]
+            mask_boundary_resized = None
+            if mask_boundary is not None:
+                mask_boundary_resized = F.interpolate(mask_boundary, size=target_size, mode='nearest')
+
+            # 【核心改变】将 dec1 作为一个分支传入 BAB，计算得到 BAB 特征
+            dec1_bab = self.boundary_attention(dec1, mask_boundary_resized)
+
+            # 从 BAB 特征得到预测结果 (对应论文的"输出2")
+            # 这里重用了 out2 作为输出层
+            logits_bab = self.out2(dec1_bab)
+
+            # 返回列表供联合损失函数计算：Loss = L(输出1) + L(输出2) + L(其它层)
+            # 在前向反向传播中，Loss(输出2) 的梯度会回传，强制优化网络内部提取边缘的能力
+            logits = [logits_main, logits_bab, logits3_coarse]
+
+        # ===================================================================
+        # 3. 测试/推理阶段 (对应论文的 Subtract: 舍弃 BAB)
+        # ===================================================================
         else:
-            logits = self.out1(out)
+            # do_ds=False 时（即推断时），直接返回主干网络的输出1。
+            # 代码根本不会执行到 BAB 的模块，彻底实现了舍弃 BAB 以减少测试参数量和计算量！
+            logits = logits_main
 
         return logits

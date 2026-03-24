@@ -157,65 +157,92 @@ class UnetrUpBlock(nn.Module):
 
         return out
 
-# 亮度增强模块
-class BrightnessEnhancement(nn.Module):
+
+class PaperAttentionModule(nn.Module):
     """
-    亮度增强模块 - 3D版本（适用于医学图像分割）
-    改进点：
-      - 输出处增加 ring 门控：只在边界环带区域 S 内增强
-      - 拆分为 M(where gate) 和 G(bounded gain)，增强更稳定
-      - 低计算量：ring 不作为输入通道，仅在输出处逐元素相乘
+    基于 AS-UNet 论文图4 提出的新型注意力模块。
     """
-    def __init__(self, channels, gmax: float = 0.7):
-        """
-        :param channels: 输入特征图通道数 C
-        :param gmax: 增益上界，控制最大增强强度（建议 0.3~0.7）
-        """
+
+    def __init__(self, channels, reduction=4):
         super().__init__()
-        self.gmax = gmax
-
-        # backbone：仍然只看 x + ref_brightness（C+1通道），计算量基本保持不变
-        self.backbone = nn.Sequential(
-            nn.Conv3d(channels + 1, 64, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv3d(64, 32, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-        )
-
-        # where gate: M in (0,1)
-        self.where_head = nn.Sequential(
-            nn.Conv3d(32, 1, kernel_size=1),
-            nn.Sigmoid()
-        )
-        # bounded gain: G in (0,gmax)
-        self.gain_head = nn.Sequential(
-            nn.Conv3d(32, 1, kernel_size=1),
+        # 1. 空间上进行压缩 (Spatial Squeeze & Excitation) -> 生成 U_{sCE}
+        # 采用 1x1x1 卷积将通道数压缩至 1，加上 Sigmoid 归一化为权重
+        self.spatial_conv = nn.Sequential(
+            nn.Conv3d(channels, 1, kernel_size=1),
             nn.Sigmoid()
         )
 
-    def forward(self, x, ref_brightness, ring):
-        """
-        :param x: [B, C, D, H, W]
-        :param ref_brightness: [B, 1, D, H, W]
-        :param ring: [B, 1, D, H, W] in {0,1} or [0,1]，边界环带区域 S
-        :return: x_enh [B,C,D,H,W]
-        """
-        # 1) 归一化亮度参考图（按你���逻辑：全局 min/max）
-        ref_brightness = (ref_brightness - ref_brightness.min()) / (
-            ref_brightness.max() - ref_brightness.min() + 1e-6
+        # 2. 通道上进行压缩 (Channel Squeeze & Excitation) -> 生成 \hat{U}_{cSE}
+        # 全局池化 -> 1x1卷积(等同全连接)+ReLU -> 1x1卷积(等同全连接)+Sigmoid
+        mid_channels = max(1, channels // reduction)
+        self.channel_fc = nn.Sequential(
+            nn.AdaptiveAvgPool3d(1),
+            nn.Conv3d(channels, mid_channels, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(mid_channels, channels, kernel_size=1),
+            nn.Sigmoid()
         )
 
-        # 2) backbone 特征
-        brightness_info = torch.cat([x, ref_brightness], dim=1)  # [B,C+1,D,H,W]
-        feat = self.backbone(brightness_info)
+    def forward(self, u):
+        # 输入 u: [B, C, D, H, W]
+        # 空间压缩特征 U_sCE: [B, 1, D, H, W]
+        u_sce = self.spatial_conv(u)
 
-        # 3) M / G
-        M = self.where_head(feat)                 # [B,1,D,H,W] (0..1)
-        G = self.gmax * self.gain_head(feat)      # [B,1,D,H,W] (0..gmax)
-        if ring is None:
-            # 推理/验证阶段可能 do_ds=False，没有 ring 来源，退化为不过滤
-            ring = 1.0
-        # 4) 输出处 ring 门控：只在 S 内增强
-        # x' = x * (1 + ring ⊙ M ⊙ G)
-        x_enh = x * (1.0 + ring * M * G)
-        return x_enh
+        # 通道压缩向量 U_cSE: [B, C, 1, 1, 1]
+        u_cse = self.channel_fc(u)
+
+        # 两者相乘得到新的权重 W: [B, C, D, H, W] (利用PyTorch广播机制自动扩展维度)
+        # 对应论文式(3): W = U_sCE x U_cSE
+        w = u_sce * u_cse
+
+        # 权重与原输入特征逐像素相乘
+        return u * w
+
+class BoundaryAttentionBlock(nn.Module):
+    """
+    边缘注意模块 (BAB) - 完全按照 AS-UNet 论文结构复现
+    此代码省去了补充层(f_{i-1})的拼接(对应L7层的最简模式)，更贴合您目前的单层输入调用逻辑。
+    """
+
+    def __init__(self, in_channels, out_channels=None):
+        super().__init__()
+        if out_channels is None:
+            out_channels = in_channels
+
+        # 1. 输入层 1x1 卷积
+        self.conv1 = nn.Conv3d(in_channels, out_channels, kernel_size=1)
+
+        # 2. 拼接掩膜边缘图 (ring) 后的 3x3 卷积
+        # 掩膜边缘图是单通道的，所以输入维度是 out_channels + 1
+        self.conv3x3 = nn.Sequential(
+            nn.Conv3d(out_channels + 1, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm3d(out_channels),  # 加入BN稳定3D网络训练
+            nn.ReLU(inplace=True)
+        )
+
+        # 3. 论文提出的新型注意力模块
+        self.attention = PaperAttentionModule(out_channels)
+
+    def forward(self, x, mask_boundary):
+        """
+        x: 输入特征图 R_i [B, C, D, H, W]
+        mask_boundary: 掩膜边缘图 (即您的 ring) [B, 1, D, H, W]
+        """
+        # 为了兼容验证/推理阶段 do_ds=False 导致 mask_boundary 为空的情况
+        if mask_boundary is None:
+            mask_boundary = torch.zeros((x.size(0), 1, x.size(2), x.size(3), x.size(4)), device=x.device,
+                                        dtype=x.dtype)
+
+        # 步骤 1：输入特征经过 1x1 卷积
+        feat = self.conv1(x)
+
+        # 步骤 2：将特征图与掩膜边缘图按通道拼接 (Concat)
+        concat_feat = torch.cat([feat, mask_boundary], dim=1)
+
+        # 步骤 3：进行 3x3 卷积提取全局信息
+        feat_3x3 = self.conv3x3(concat_feat)
+
+        # 步骤 4：经过论文提出的乘法注意力模块
+        out = self.attention(feat_3x3)
+
+        return out
