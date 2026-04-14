@@ -1,0 +1,10 @@
+# 忽略数据集和输出结果
+DATASET_Acdc/
+output_acdc/
+
+# 忽略 Python 编译缓存
+__pycache__/
+*.pyc
+
+# 忽略 Windows 跨系统产生的幽灵文件
+*Zone.Identifier
