@@ -73,6 +73,13 @@ class unetr_pp_trainer_acdc(Trainer_acdc):
         self.down_stride = [[1, 4, 4], [1, 8, 8], [2, 16, 16], [4, 32, 32]]
         self.deep_supervision = True
 
+        # =========== 新增：早停与热身机制参数 ===========
+        self.warmup_epochs = 200  # 热身轮次：前 100 轮只记录不触发早停 (可根据需要修改)
+        self.custom_patience = 50  # 容忍度：此后连续 10 轮不提升则停止
+        self.best_custom_score = -1.0  # 记录历史最优分数
+        self.epochs_no_improve = 0  # 记录当前连续未提升的轮次
+        # ===============================================
+
     def initialize(self, training=True, force_load_plans=False):
         """
         - replaced get_default_augmentation with get_moreDA_augmentation
@@ -501,14 +508,48 @@ class unetr_pp_trainer_acdc(Trainer_acdc):
 
     def on_epoch_end(self):
         """
-        overwrite patient-based early stopping. Always run to 1000 epochs
-        :return:
+        Modified: 加入热身轮次与自定义早停机制 (Warm-up + Early Stopping)
         """
-        super().on_epoch_end()
-        continue_training = self.epoch < self.max_num_epochs
+        # 调用父类的方法，完成基础指标更新和模型保存，并接收父类的状态
+        continue_training = super().on_epoch_end()
 
-        # it can rarely happen that the momentum of nnUNetTrainerV2 is too high for some dataset. If at epoch 100 the
-        # estimated validation Dice is still 0 then we reduce the momentum from 0.99 to 0.95
+        # 获取当前验证集的分数 (nnUNet 默认将 Dice 等 metric 存放在 all_val_eval_metrics)
+        if len(self.all_val_eval_metrics) > 0:
+            current_score = self.all_val_eval_metrics[-1]
+        else:
+            # 万一没有 metric，用 validation loss 的负数代替作为判断标准
+            current_score = -self.all_val_losses[-1]
+
+            # =========== 核心逻辑：热身与寻优早停 ===========
+        if self.epoch < self.warmup_epochs:
+            # 1. 热身期内 (epoch < warmup_epochs)：
+            # 不论分数如何波动，都不累积不提升的次数 (清零)，以保证模型度过初期的震荡
+            self.epochs_no_improve = 0
+            # 但我们在热身期也同步记录分数，这样热身期结束时 best_score 不会是瞎猜的
+            if current_score > self.best_custom_score:
+                self.best_custom_score = current_score
+        else:
+            # 2. 过了热身期：开始严格执行 10 轮寻优
+            if current_score > self.best_custom_score:
+                # 发现了更高的分数！更新最优分数，并重置惩罚计数器
+                self.best_custom_score = current_score
+                self.epochs_no_improve = 0
+                self.print_to_log_file(
+                    f"【寻优更新】在第 {self.epoch} 轮发现新最优验证分数: {self.best_custom_score:.4f}")
+            else:
+                # 分数没有超过最优记录，累计未提升轮数
+                self.epochs_no_improve += 1
+                self.print_to_log_file(
+                    f"【早停监测】分数未提升: 累计 {self.epochs_no_improve} / {self.custom_patience} 轮 (当前最高: {self.best_custom_score:.4f})")
+
+            # 3. 判断是否达到容忍度上限
+            if self.epochs_no_improve >= self.custom_patience:
+                self.print_to_log_file(
+                    f"\n【触发早停】度过 {self.warmup_epochs} 轮热身后，已连续 {self.custom_patience} 轮未超过历史最优分数。提前终止训练！")
+                continue_training = False
+        # ===============================================
+
+        # 以下保留原作者处理 momentum 的逻辑
         if self.epoch == 100:
             if self.all_val_eval_metrics[-1] == 0:
                 self.optimizer.param_groups[0]["momentum"] = 0.95
@@ -517,6 +558,11 @@ class unetr_pp_trainer_acdc(Trainer_acdc):
                                        "high momentum. High momentum (0.99) is good for datasets where it works, but "
                                        "sometimes causes issues such as this one. Momentum has now been reduced to "
                                        "0.95 and network weights have been reinitialized")
+
+        # 确保训练不会超过设定的绝对最大轮次 (self.max_num_epochs)
+        if self.epoch >= self.max_num_epochs - 1:
+            continue_training = False
+
         return continue_training
 
     def run_training(self):
